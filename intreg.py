@@ -21,42 +21,59 @@ import pandas as pd
 from scipy.optimize import minimize
 import scipy.stats
 from scipy.special import log_ndtr
-from sklearn.linear_model import LinearRegression
+from statsmodels.regression.linear_model import WLS
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import sklearn.preprocessing as skl
 
-def split_left_right_censored(x, y1, y2, cens): ## 'cens' has to be created
+def split_left_right_censored(x, y1, y2, cens, w): ## 'cens' has to be created
     counts = cens.value_counts()
     if -1 not in counts and 1 not in counts:
         warnings.warn("No censored observations; use regression methods for uncensored data")
     xs = []
     ys = []
-
+    ws = []
+#    w = [1]*len(y1) ## analytical weights
+    ## check if w is inputted. If not, assign a vector of 1s
+    try:
+        w
+    except NameError:
+        var_exists = False
+    else:
+        var_exists = True
+    if var_exists == False:
+        w = [1]*len(y1)
+        
     for value in [-1, 0, 1]:
         if value in counts:
             if value == -1:
                 split = cens == value
                 y_split = np.squeeze(y2[split].values)
                 x_split = x[split]
+                w_split = w[split]
             elif value == 1:
                 split = cens == value
                 y_split = np.squeeze(y1[split].values)
                 x_split = x[split]
+                w_split = w[split]
             elif value == 0:
                 split = cens == value
                 ys1 = np.squeeze(y1[split].values)
                 ys2 = np.squeeze(y2[split].values)
-                x_split = x[split]               
+                x_split = x[split] 
+                w_split = w[split]
         else:
-            y_split, x_split = None, None
+            y_split, x_split, w_split = None, None, None
         xs.append(x_split)
+        ws.append(w_split)
         if value == -1 or value == 1:
             ys.append(y_split)        
-    return xs, ys, ys1, ys2
+    
+    return xs, ys, ys1, ys2, ws
 
 
-def tobit_neg_log_likelihood(xs, ys, ys1, ys2, params):
+def tobit_neg_log_likelihood(xs, ys, ys1, ys2, ws, params):
     x_left, x_mid, x_right = xs
+    w_left, w_mid, w_right = ws    
     y_left, y_right = ys
 
     b = params[:-1]
@@ -68,17 +85,31 @@ def tobit_neg_log_likelihood(xs, ys, ys1, ys2, params):
     cens2 = False
     if y_left is not None:
         cens2 = True
-        left = scipy.stats.norm.logcdf((y_left - np.dot(x_left, b)) / s)
+        left = w_left*scipy.stats.norm.logcdf((y_left - np.dot(x_left, b)) / s)
         to_cat.append(left)
     if y_right is not None:
         cens2 = True
 #        right = scipy.stats.norm.logsf(y_right - np.dot(x_right, b) / s)
-        right = np.log(1 - scipy.stats.norm.cdf((y_right - np.dot(x_right, b))/s))
+        right = w_right*np.log(1 - scipy.stats.norm.cdf((y_right - np.dot(x_right, b))/s))
         to_cat.append(right)
     if ys1 is not None and ys2 is not None:
-        inter = np.log(scipy.stats.norm.cdf((ys2 - np.dot(x_mid, b)) / s) - 
+        inter = w_mid*np.log(scipy.stats.norm.cdf((ys2 - np.dot(x_mid, b)) / s) - 
                        scipy.stats.norm.cdf((ys1 - np.dot(x_mid, b)) / s))
-        to_cat.append(inter)
+        to_cat.append(inter)    
+    
+#    if y_left is not None:
+#        cens2 = True
+#        left = w_left*scipy.stats.norm.logcdf((y_left - np.dot(x_left, b)) / (s / np.sqrt(w_left)))
+#        to_cat.append(left)
+#    if y_right is not None:
+#        cens2 = True
+##        right = scipy.stats.norm.logsf(y_right - np.dot(x_right, b) / s)
+#        right = w_right*np.log(1 - scipy.stats.norm.cdf((y_right - np.dot(x_right, b))/(s/np.sqrt(w_right))))
+#        to_cat.append(right)
+#    if ys1 is not None and ys2 is not None:
+#        inter = w_mid*np.log(scipy.stats.norm.cdf((ys2 - np.dot(x_mid, b)) / (s/np.sqrt(w_mid))) - 
+#                       scipy.stats.norm.cdf((ys1 - np.dot(x_mid, b)) / (s/np.sqrt(w_mid))))
+#        to_cat.append(inter)
         # mid_stats = (y_mid - np.dot(x_mid, b)) / s
         # mid = math.log(scipy.stats.norm.cdf(mid_stats) - scipy.stats.norm.cdf(
                # max(np.finfo('float').resolution, s))    
@@ -118,7 +149,7 @@ class TobitModel:
         self.intercept_ = None
         self.sigma_ = None
 
-    def fit(self, x, y1, y2, cens, verbose=False):
+    def fit(self, x, y1, y2, cens, w, verbose=False):
         """
         Fit a maximum-likelihood Tobit regression
         :param x: Pandas DataFrame (n_samples, n_features): Data
@@ -135,32 +166,41 @@ class TobitModel:
 
 ##		qui gen double `z' = cond(`y1'<.&`y2'<.,(`y1'+`y2')/2, /*
 ##		*/		 cond(`y1'<.,`y1',`y2')) `moff' if `doit'
-        y = [None]*len(y1)
-        for i in range(len(y1)):
-            if np.isnan(y1[i]) and np.isnan(y2[i]) == False:
-                y[i] = y2[i] ## Left-censored
-            elif np.isnan(y2[i]) and np.isnan(y1[i]) == False:
-                y[i] = y1[i] ## Right-censored
-            elif np.isnan(y1[i]) and np.isnan(y2[i]):
-                y[i] = None ## Missing row
-            else:
-                y[i] = (y1[i] + y2[i])/2 ## interval
-        
-        init_reg = LinearRegression(fit_intercept=False).fit(x_copy, y)
-        b0 = init_reg.coef_
+        y = []
+        counts = cens.value_counts() 
+        for value in [-1, 0, 1]:
+            if value in counts:
+                if value == -1:
+                    split = cens == value
+                    y_l = np.squeeze(y2[split].values)
+                    y.append(y_l)
+                elif value == 1:
+                    split = cens == value
+                    y_r = np.squeeze(y1[split].values)
+                    y.append(y_r)
+                elif value == 0:
+                    split = cens == value
+                    y_int = np.squeeze((y1[split].values + y2[split].values)/2)
+                    y.append(y_int)
+
+        y = np.concatenate(y, axis=0)
+        init_reg = WLS(y, x_copy, weights=w).fit()
+        b0 = init_reg.params
+        print(b0)
         y_pred = init_reg.predict(x_copy)
         resid = y - y_pred
         resid_var = np.var(resid)
         s0 = np.sqrt(resid_var)
         params0 = np.append(b0, s0)
-        xs, ys, ys1, ys2 = split_left_right_censored(x_copy, y1, y2, cens)
-        result = minimize(lambda params: tobit_neg_log_likelihood(xs, ys, ys1, ys2, params), params0,
-                          jac=None, method='Nelder-Mead', tol=0.000001, options={'disp': verbose, 'maxiter':10000000})
+        xs, ys, ys1, ys2, ws = split_left_right_censored(x_copy, y1, y2, cens, w)
+        result = minimize(lambda params: tobit_neg_log_likelihood(xs, ys, ys1, ys2, ws, params), params0,
+                          jac=None, method='Powell', tol=0.000001,
+                          options={'disp': verbose, 'maxiter':10000000, 'fatol':0.00000001})
 
         if verbose:
             print(result)
-        self.ols_coef_ = b0[1:]
-        self.ols_intercept = b0[0]
+#        self.ols_coef_ = b0[1:]
+#        self.ols_intercept = b0[0]
         if self.fit_intercept:
             self.intercept_ = result.x[0]
             self.coef_ = result.x[1:-1]
